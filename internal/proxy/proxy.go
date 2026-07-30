@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,8 +24,8 @@ import (
 var knownModels = []string{"auto", "hy3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "minimax-m3", "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro"}
 
 type Config struct {
-	APIKey, ProxyAPIKey, BaseURL, Host, Port, DefaultModel string
-	RequestTimeout, SessionTTL                             time.Duration
+	APIKey, BaseURL, Host, Port, DefaultModel string
+	RequestTimeout, SessionTTL                time.Duration
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -33,7 +34,7 @@ func LoadConfigFromEnv() (Config, error) {
 		return Config{}, errors.New("CODEBUDDY_API_KEY is required")
 	}
 	return Config{
-		APIKey: key, ProxyAPIKey: os.Getenv("PROXY_API_KEY"), BaseURL: resolveBaseURL(os.Getenv("CODEBUDDY_BASE_URL"), os.Getenv("CODEBUDDY_INTERNET_ENVIRONMENT")),
+		APIKey: key, BaseURL: resolveBaseURL(os.Getenv("CODEBUDDY_BASE_URL"), os.Getenv("CODEBUDDY_INTERNET_ENVIRONMENT")),
 		Host: valueOr(os.Getenv("HOST"), "0.0.0.0"), Port: valueOr(os.Getenv("PORT"), "8787"), DefaultModel: valueOr(os.Getenv("DEFAULT_MODEL"), "hy3"),
 		RequestTimeout: durationEnv("REQUEST_TIMEOUT_MS", 10*time.Minute), SessionTTL: durationEnv("SESSION_TTL_MS", 30*time.Minute),
 	}, nil
@@ -162,10 +163,30 @@ type Handler struct {
 	version  string
 	client   *http.Client
 	sessions *sessionStore
+	logger   *slog.Logger
 }
 
 func New(cfg Config, version string) *Handler {
-	return &Handler{cfg: cfg, version: version, client: &http.Client{Timeout: cfg.RequestTimeout}, sessions: newSessionStore(cfg.SessionTTL)}
+	return NewWithLogger(cfg, version, nil)
+}
+
+// NewWithLogger creates a handler using logger. A nil logger emits JSON logs to stdout.
+// It is primarily useful for embedding the proxy or directing logs in tests.
+func NewWithLogger(cfg Config, version string, logger *slog.Logger) *Handler {
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	}
+	return &Handler{cfg: cfg, version: version, client: &http.Client{Timeout: cfg.RequestTimeout}, sessions: newSessionStore(cfg.SessionTTL), logger: logger}
+}
+
+// LogStartup records the safe, operational details needed to identify a running instance.
+func (h *Handler) LogStartup(address string) {
+	h.logger.Info("server_started", "version", h.version, "address", address, "upstream", h.cfg.BaseURL)
+}
+
+// LogServerError records a server-level error without including request data.
+func (h *Handler) LogServerError(err error) {
+	h.logger.Error("server_stopped", "error", err)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -179,10 +200,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	if path == "/health" || path == "/v1/health" {
 		h.health(w)
-		return
-	}
-	if h.cfg.ProxyAPIKey != "" && r.Header.Get("Authorization") != "Bearer "+h.cfg.ProxyAPIKey {
-		writeError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", nil)
 		return
 	}
 	if r.Method == http.MethodGet && (path == "/v1/models" || path == "/models") {
@@ -216,7 +233,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), "invalid_request_error", nil)
 		return
 	}
-	if msgs, ok := payload["messages"].([]any); !ok || len(msgs) == 0 {
+	msgs, ok := payload["messages"].([]any)
+	if !ok || len(msgs) == 0 {
 		writeError(w, http.StatusBadRequest, "messages must be a non-empty array", "invalid_request_error", nil)
 		return
 	}
@@ -234,9 +252,12 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	key := firstNonEmpty(r.Header.Get("X-Session-Id"), r.Header.Get("X-Conversation-Id"), stringValue(payload["session_id"]), stringValue(payload["user"]))
 	s := h.sessions.acquire(key)
 	s.beginTurn()
+	started := time.Now()
+	h.logger.Info("chat_request_started", "model", model, "stream", wantStream, "message_count", len(msgs), "session_reused", key != "")
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, strings.TrimRight(h.cfg.BaseURL, "/")+"/chat/completions", strings.NewReader(string(body)))
 	if err != nil {
+		h.logger.Error("chat_request_failed", "model", model, "stream", wantStream, "stage", "create_upstream_request", "duration_ms", time.Since(started).Milliseconds())
 		writeError(w, http.StatusInternalServerError, err.Error(), "internal_error", nil)
 		return
 	}
@@ -245,24 +266,38 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
+		h.logger.Error("chat_request_failed", "model", model, "stream", wantStream, "stage", "connect_upstream", "duration_ms", time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", nil)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.logger.Warn("upstream_response_failed", "model", model, "stream", wantStream, "upstream_status", resp.StatusCode, "duration_ms", time.Since(started).Milliseconds())
 		h.upstreamFailure(w, resp)
 		return
 	}
 	if wantStream {
-		h.relaySSE(w, resp.Body, model)
+		chunks, firstToken, err := h.relaySSE(w, resp.Body, model)
+		attrs := []any{"model", model, "stream", true, "chunk_count", chunks, "duration_ms", time.Since(started).Milliseconds()}
+		if !firstToken.IsZero() {
+			attrs = append(attrs, "ttft_ms", firstToken.Sub(started).Milliseconds())
+		}
+		if err != nil {
+			attrs = append(attrs, "stage", "read_upstream_stream")
+			h.logger.Error("chat_request_failed", attrs...)
+			return
+		}
+		h.logger.Info("chat_request_completed", attrs...)
 		return
 	}
 	chunks, err := readSSE(resp.Body, model)
 	if err != nil {
+		h.logger.Error("chat_request_failed", "model", model, "stream", false, "stage", "read_upstream_stream", "duration_ms", time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, aggregate(chunks, model))
+	h.logger.Info("chat_request_completed", "model", model, "stream", false, "chunk_count", len(chunks), "duration_ms", time.Since(started).Milliseconds())
 }
 
 func (h *Handler) headers(s *session) map[string]string {
@@ -333,7 +368,7 @@ func (h *Handler) upstreamFailure(w http.ResponseWriter, resp *http.Response) {
 	}
 	writeError(w, status, msg, "upstream_error", data["code"])
 }
-func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) {
+func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) (int, time.Time, error) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -341,6 +376,8 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 	flusher, _ := w.(http.Flusher)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
+	var chunks int
+	var firstToken time.Time
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data:") {
@@ -350,8 +387,12 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 				if flusher != nil {
 					flusher.Flush()
 				}
-				return
+				return chunks, firstToken, nil
 			}
+			if firstToken.IsZero() {
+				firstToken = time.Now()
+			}
+			chunks++
 			var chunk map[string]any
 			if json.Unmarshal([]byte(data), &chunk) == nil {
 				normalized, _ := json.Marshal(normalize(chunk, model))
@@ -365,6 +406,10 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 		}
 	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+	return chunks, firstToken, scanner.Err()
 }
 func readSSE(body io.Reader, model string) ([]map[string]any, error) {
 	var out []map[string]any

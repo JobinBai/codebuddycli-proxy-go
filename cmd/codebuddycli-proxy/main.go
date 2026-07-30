@@ -1,8 +1,7 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -15,7 +14,8 @@ var version = "dev"
 func main() {
 	cfg, err := proxy.LoadConfigFromEnv()
 	if err != nil {
-		log.Fatal(err)
+		slog.New(slog.NewJSONHandler(os.Stdout, nil)).Error("configuration_error", "error", err)
+		os.Exit(1)
 	}
 	h := proxy.New(cfg, version)
 	srv := &http.Server{
@@ -23,9 +23,9 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	fmt.Printf("codebuddycli-proxy %s listening on http://%s (upstream: %s)\n", version, srv.Addr, cfg.BaseURL)
+	h.LogStartup(srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintln(os.Stderr, err)
+		h.LogServerError(err)
 		os.Exit(1)
 	}
 }
