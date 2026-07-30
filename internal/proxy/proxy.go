@@ -32,6 +32,12 @@ type Config struct {
 	APIKey, BaseURL, Host, Port, DefaultModel   string
 	RequestTimeout, SessionTTL, ModelRefreshTTL time.Duration
 	ShowReasoning                               bool
+	// ReasoningCoalesce applies bounded windowed coalescing to text requests so
+	// the client receives far fewer reasoning_content events without waiting for
+	// the whole reasoning phase to finish (low first-token latency).
+	ReasoningCoalesce         bool
+	ReasoningCoalesceInterval time.Duration
+	ReasoningCoalesceChars    int
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -42,7 +48,11 @@ func LoadConfigFromEnv() (Config, error) {
 	return Config{
 		APIKey: key, BaseURL: resolveBaseURL(os.Getenv("CODEBUDDY_BASE_URL"), os.Getenv("CODEBUDDY_INTERNET_ENVIRONMENT")),
 		Host: valueOr(os.Getenv("HOST"), "0.0.0.0"), Port: valueOr(os.Getenv("PORT"), "8787"), DefaultModel: valueOr(os.Getenv("DEFAULT_MODEL"), "hy3"),
-		RequestTimeout: durationEnv("REQUEST_TIMEOUT_MS", 10*time.Minute), SessionTTL: durationEnv("SESSION_TTL_MS", 30*time.Minute), ModelRefreshTTL: durationEnv("MODEL_REFRESH_INTERVAL_MS", 10*time.Minute), ShowReasoning: os.Getenv("HIDE_REASONING") != "1",
+		RequestTimeout: durationEnv("REQUEST_TIMEOUT_MS", 10*time.Minute), SessionTTL: durationEnv("SESSION_TTL_MS", 30*time.Minute), ModelRefreshTTL: durationEnv("MODEL_REFRESH_INTERVAL_MS", 10*time.Minute),
+		ShowReasoning:             os.Getenv("HIDE_REASONING") != "1",
+		ReasoningCoalesce:         os.Getenv("REASONING_COALESCE") != "0",
+		ReasoningCoalesceInterval: durationEnv("REASONING_COALESCE_MS", 250*time.Millisecond),
+		ReasoningCoalesceChars:    intEnv("REASONING_COALESCE_CHARS", 1024),
 	}, nil
 }
 
@@ -63,6 +73,12 @@ func valueOr(v, fallback string) string {
 func durationEnv(name string, fallback time.Duration) time.Duration {
 	if n, err := strconv.ParseInt(os.Getenv(name), 10, 64); err == nil && n > 0 {
 		return time.Duration(n) * time.Millisecond
+	}
+	return fallback
+}
+func intEnv(name string, fallback int) int {
+	if n, err := strconv.Atoi(os.Getenv(name)); err == nil && n > 0 {
+		return n
 	}
 	return fallback
 }
@@ -390,6 +406,9 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	payload["model"] = model
 	payload["stream"] = true
+	if h.cfg.ShowReasoning {
+		ensureReasoningParams(payload)
+	}
 	key := firstNonEmpty(r.Header.Get("X-Session-Id"), r.Header.Get("X-Conversation-Id"), stringValue(payload["session_id"]), stringValue(payload["user"]))
 	s := h.sessions.acquire(key)
 	s.beginTurn()
@@ -420,7 +439,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if wantStream {
-		stats, err := h.relaySSE(w, resp.Body, model, hasImage && h.cfg.ShowReasoning)
+		stats, err := h.relaySSE(w, resp.Body, model, h.reasoningModeFor(hasImage))
 		attrs := []any{"model", model, "stream", true, "chunk_count", stats.chunks, "upstream_ms", upstreamMS, "duration_ms", time.Since(started).Milliseconds()}
 		if !stats.firstToken.IsZero() {
 			attrs = append(attrs, "ttft_ms", stats.firstToken.Sub(started).Milliseconds())
@@ -606,7 +625,33 @@ type streamStats struct {
 	usage      usageMetrics
 }
 
-func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, aggregateReasoning bool) (streamStats, error) {
+// reasoningMode controls how upstream reasoning_content deltas are forwarded.
+type reasoningMode int
+
+const (
+	reasoningOff         reasoningMode = iota // strip all reasoning from the response
+	reasoningAggregate                        // buffer the whole reasoning phase into a single event (images)
+	reasoningCoalesce                         // bounded windowed coalescing for text (low latency, few events)
+	reasoningPassthrough                      // forward reasoning deltas 1:1 (legacy text behavior)
+)
+
+// reasoningModeFor selects the reasoning handling strategy for a request.
+func (h *Handler) reasoningModeFor(hasImage bool) reasoningMode {
+	if !h.cfg.ShowReasoning {
+		return reasoningOff
+	}
+	if hasImage {
+		// Images already reason briefly; keep the single-event aggregate so the
+		// existing contract (one aggregated reasoning event) is preserved.
+		return reasoningAggregate
+	}
+	if h.cfg.ReasoningCoalesce {
+		return reasoningCoalesce
+	}
+	return reasoningPassthrough
+}
+
+func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, mode reasoningMode) (streamStats, error) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -616,6 +661,10 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, 
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
 	var stats streamStats
 	bufferedReasoning := make(map[int]*boundedText)
+	// coalesceStart marks when the current reasoning window began. It is set the
+	// first time a reasoning delta is buffered and reset after every flush, so the
+	// time window keeps advancing even when no flush has happened yet.
+	coalesceStart := time.Time{}
 	emit := func(chunk map[string]any) {
 		if stats.firstToken.IsZero() {
 			stats.firstToken = time.Now()
@@ -646,9 +695,32 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, 
 			}
 		}
 		bufferedReasoning = make(map[int]*boundedText)
+		coalesceStart = time.Now()
 		if len(choices) > 0 {
 			emit(map[string]any{"choices": choices})
 		}
+	}
+	// coalesceShouldFlush decides whether the buffered reasoning should be emitted
+	// now: either enough wall-clock time passed (keeps the stream feeling live) or
+	// enough text accumulated (bounds event count and memory). An unset lastFlush
+	// (zero value) always flushes, so the first reasoning characters appear at once.
+	coalesceShouldFlush := func() bool {
+		if mode != reasoningCoalesce {
+			return false
+		}
+		if !coalesceStart.IsZero() && h.cfg.ReasoningCoalesceInterval > 0 && time.Since(coalesceStart) >= h.cfg.ReasoningCoalesceInterval {
+			return true
+		}
+		if h.cfg.ReasoningCoalesceChars > 0 {
+			total := 0
+			for _, b := range bufferedReasoning {
+				total += b.Len()
+				if total >= h.cfg.ReasoningCoalesceChars {
+					return true
+				}
+			}
+		}
+		return false
 	}
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -664,12 +736,13 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, 
 			}
 			var chunk map[string]any
 			if json.Unmarshal([]byte(data), &chunk) == nil {
-				if !h.cfg.ShowReasoning {
+				switch mode {
+				case reasoningOff:
 					removeReasoning([]map[string]any{chunk})
 					if !hasVisibleSSEData(chunk) {
 						continue
 					}
-				} else if aggregateReasoning {
+				case reasoningAggregate:
 					bufferReasoning(chunk, bufferedReasoning)
 					if requiresReasoningFlush(chunk) {
 						flushReasoning()
@@ -677,6 +750,19 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, 
 					if !hasVisibleSSEData(chunk) {
 						continue
 					}
+				case reasoningCoalesce:
+					bufferReasoning(chunk, bufferedReasoning)
+					if coalesceStart.IsZero() {
+						coalesceStart = time.Now()
+					}
+					if requiresReasoningFlush(chunk) || coalesceShouldFlush() {
+						flushReasoning()
+					}
+					if !hasVisibleSSEData(chunk) {
+						continue
+					}
+				case reasoningPassthrough:
+					// forward reasoning deltas verbatim, do not strip
 				}
 				emit(chunk)
 			} else {
@@ -723,6 +809,7 @@ func (b *boundedText) String() string {
 	}
 	return b.text.String()
 }
+func (b *boundedText) Len() int { return b.text.Len() }
 
 func bufferReasoning(chunk map[string]any, buffered map[int]*boundedText) {
 	for _, raw := range sliceValue(chunk["choices"]) {
@@ -748,7 +835,13 @@ func requiresReasoningFlush(chunk map[string]any) bool {
 			return true
 		}
 		delta, _ := choice["delta"].(map[string]any)
-		if stringValue(delta["content"]) != "" || delta["tool_calls"] != nil {
+		if stringValue(delta["content"]) != "" {
+			return true
+		}
+		// An empty tool_calls array ([]) is just the default shape of every delta
+		// and must NOT trigger a flush; only a non-empty array means a real tool
+		// call. The upstream sends "tool_calls":[] on every delta.
+		if toolCalls, ok := delta["tool_calls"].([]any); ok && len(toolCalls) > 0 {
 			return true
 		}
 	}
@@ -783,8 +876,22 @@ func removeReasoning(chunks []map[string]any) {
 		}
 	}
 }
+
+// ensureReasoningParams injects default reasoning parameters when the client
+// did not provide them. This makes reasoning appear by default while still
+// respecting an explicit client choice.
+func ensureReasoningParams(payload map[string]any) {
+	if payload["reasoning_effort"] != nil {
+		return
+	}
+	if payload["reasoning"] != nil {
+		return
+	}
+	payload["reasoning_effort"] = "high"
+	payload["reasoning"] = map[string]any{"effort": "high", "summary": "auto"}
+}
 func hasVisibleSSEData(chunk map[string]any) bool {
-	if _, ok := chunk["usage"]; ok {
+	if usage, ok := chunk["usage"]; ok && usage != nil {
 		return true
 	}
 	for _, raw := range sliceValue(chunk["choices"]) {
@@ -793,8 +900,24 @@ func hasVisibleSSEData(chunk map[string]any) bool {
 			return true
 		}
 		if delta, _ := choice["delta"].(map[string]any); len(delta) > 0 {
-			return true
+			for _, v := range delta {
+				if !isEmptyDeltaValue(v) {
+					return true
+				}
+			}
 		}
+	}
+	return false
+}
+
+func isEmptyDeltaValue(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return x == "" || x == "assistant"
+	case []any:
+		return len(x) == 0
 	}
 	return false
 }

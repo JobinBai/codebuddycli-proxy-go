@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -217,5 +218,147 @@ func TestTextLogsIncludePromptAndUsageWithoutAPIKey(t *testing.T) {
 	}
 	if bytes.Contains([]byte(got), []byte(apiKey)) {
 		t.Fatalf("logs expose API key: %s", got)
+	}
+}
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// TestTextStreamingReasoningIsCoalesced verifies that a text request with
+// reasoning enabled coalesces the many upstream reasoning_content deltas into a
+// small number of events (bounded buffering) while keeping every fragment and
+// preserving reasoning-before-answer ordering. This is the elegant middle path
+// between full aggregate (bad first-token latency) and 1:1 passthrough (hundreds
+// of cards in clients that render one card per delta).
+func TestTextStreamingReasoningIsCoalesced(t *testing.T) {
+	fragments := []string{"思", "考", "：", "农", "夫", "有", "17", "只", "羊", "，", "剩", "9只"}
+	var sse strings.Builder
+	for i, f := range fragments {
+		role := ""
+		if i == 0 {
+			role = `"role":"assistant",`
+		}
+		fmt.Fprintf(&sse, "data: {\"choices\":[{\"index\":0,\"delta\":{%s\"reasoning_content\":%s}}]}\n\n", role, jsonString(f))
+	}
+	sse.WriteString("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"答案是9只羊。\"},\"finish_reason\":\"stop\"}]}\n\n")
+	sse.WriteString("data: [DONE]\n\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sse.String())
+	}))
+	defer upstream.Close()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: true, ReasoningCoalesce: true, ReasoningCoalesceInterval: 250 * time.Millisecond, ReasoningCoalesceChars: 1024}, "test", io.Discard)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"羊的问题"}],"stream":true}`)))
+	got := rr.Body.String()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, got)
+	}
+	reasoningEvents := strings.Count(got, "reasoning_content")
+	if reasoningEvents == 0 {
+		t.Fatalf("reasoning must be present when enabled: %s", got)
+	}
+	if reasoningEvents > len(fragments)/2 {
+		t.Fatalf("expected coalescing to reduce %d upstream deltas to fewer events, got %d: %s", len(fragments), reasoningEvents, got)
+	}
+	for _, f := range fragments {
+		if !strings.Contains(got, f) {
+			t.Fatalf("coalescing dropped fragment %q: %s", f, got)
+		}
+	}
+	if !strings.Contains(got, "答案是9只羊。") {
+		t.Fatalf("final content missing: %s", got)
+	}
+	if strings.Index(got, "reasoning_content") > strings.Index(got, "答案是9只羊。") {
+		t.Fatalf("reasoning must precede final content: %s", got)
+	}
+}
+
+// TestTextStreamingReasoningPassthroughWhenDisabled confirms the legacy 1:1
+// behavior is preserved when REASONING_COALESCE is turned off.
+func TestTextStreamingReasoningPassthroughWhenDisabled(t *testing.T) {
+	fragments := []string{"a", "b", "c", "d", "e"}
+	var sse strings.Builder
+	for _, f := range fragments {
+		fmt.Fprintf(&sse, "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":%s}}]}\n\n", jsonString(f))
+	}
+	sse.WriteString("data: [DONE]\n\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sse.String())
+	}))
+	defer upstream.Close()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: true, ReasoningCoalesce: false}, "test", io.Discard)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hi"}],"stream":true}`)))
+	got := rr.Body.String()
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, got)
+	}
+	if events := strings.Count(got, "reasoning_content"); events != len(fragments) {
+		t.Fatalf("passthrough must keep %d events, got %d: %s", len(fragments), events, got)
+	}
+}
+
+func TestReasoningParamsAutoInjected(t *testing.T) {
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: true}, "test", io.Discard)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hi"}],"stream":false}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rr.Code, rr.Body.String())
+	}
+	if gotBody["reasoning_effort"] != "high" {
+		t.Fatalf("expected reasoning_effort=high, got %v", gotBody["reasoning_effort"])
+	}
+	reasoning, ok := gotBody["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
+		t.Fatalf("unexpected reasoning payload: %v", gotBody["reasoning"])
+	}
+}
+
+func TestReasoningParamsNotOverridden(t *testing.T) {
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: true}, "test", io.Discard)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hi"}],"stream":false,"reasoning_effort":"low"}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if gotBody["reasoning_effort"] != "low" {
+		t.Fatalf("expected client reasoning_effort preserved, got %v", gotBody["reasoning_effort"])
+	}
+	if gotBody["reasoning"] != nil {
+		t.Fatalf("expected no reasoning object when client only sent reasoning_effort, got %v", gotBody["reasoning"])
+	}
+}
+
+func TestReasoningParamsNotInjectedWhenHidden(t *testing.T) {
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: false}, "test", io.Discard)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hi"}],"stream":false}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if gotBody["reasoning_effort"] != nil || gotBody["reasoning"] != nil {
+		t.Fatalf("reasoning params must not be injected when hidden: %v", gotBody)
 	}
 }
