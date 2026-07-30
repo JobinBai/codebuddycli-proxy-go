@@ -4,7 +4,6 @@ on:
     tags: ['v*']
 permissions:
   contents: write
-  packages: write
 jobs:
   binaries:
     runs-on: ubuntu-latest
@@ -38,13 +37,12 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/${{ github.repository_owner }}/codebuddycli-proxy-go
+          images: ${{ secrets.DOCKER_USERNAME }}/codebuddycli-proxy-go
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
