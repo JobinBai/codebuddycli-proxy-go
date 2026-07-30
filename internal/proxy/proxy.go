@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,9 +25,13 @@ import (
 
 var knownModels = []string{"auto", "hy3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "minimax-m3", "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "deepseek-v4-flash", "deepseek-v4-pro"}
 
+const cliVersion = "2.130.0"
+const maxBufferedReasoningBytes = 1 << 20
+
 type Config struct {
-	APIKey, BaseURL, Host, Port, DefaultModel string
-	RequestTimeout, SessionTTL                time.Duration
+	APIKey, BaseURL, Host, Port, DefaultModel   string
+	RequestTimeout, SessionTTL, ModelRefreshTTL time.Duration
+	ShowReasoning                               bool
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -36,7 +42,7 @@ func LoadConfigFromEnv() (Config, error) {
 	return Config{
 		APIKey: key, BaseURL: resolveBaseURL(os.Getenv("CODEBUDDY_BASE_URL"), os.Getenv("CODEBUDDY_INTERNET_ENVIRONMENT")),
 		Host: valueOr(os.Getenv("HOST"), "0.0.0.0"), Port: valueOr(os.Getenv("PORT"), "8787"), DefaultModel: valueOr(os.Getenv("DEFAULT_MODEL"), "hy3"),
-		RequestTimeout: durationEnv("REQUEST_TIMEOUT_MS", 10*time.Minute), SessionTTL: durationEnv("SESSION_TTL_MS", 30*time.Minute),
+		RequestTimeout: durationEnv("REQUEST_TIMEOUT_MS", 10*time.Minute), SessionTTL: durationEnv("SESSION_TTL_MS", 30*time.Minute), ModelRefreshTTL: durationEnv("MODEL_REFRESH_INTERVAL_MS", 10*time.Minute), ShowReasoning: os.Getenv("HIDE_REASONING") != "1",
 	}, nil
 }
 
@@ -164,6 +170,7 @@ type Handler struct {
 	client   *http.Client
 	sessions *sessionStore
 	logger   *textLogger
+	catalog  *modelCatalog
 }
 
 func New(cfg Config, version string) *Handler {
@@ -175,7 +182,7 @@ func NewWithLogWriter(cfg Config, version string, output io.Writer) *Handler {
 	if output == nil {
 		output = os.Stdout
 	}
-	return &Handler{cfg: cfg, version: version, client: &http.Client{Timeout: cfg.RequestTimeout}, sessions: newSessionStore(cfg.SessionTTL), logger: newTextLogger(output)}
+	return &Handler{cfg: cfg, version: version, client: &http.Client{Timeout: cfg.RequestTimeout}, sessions: newSessionStore(cfg.SessionTTL), logger: newTextLogger(output), catalog: newModelCatalog(cfg.ModelRefreshTTL)}
 }
 
 // LogStartup records the safe, operational details needed to identify a running instance.
@@ -230,7 +237,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && (path == "/v1/models" || path == "/models") {
-		h.models(w)
+		h.models(w, r)
 		return
 	}
 	if r.Method == http.MethodPost && (path == "/v1/chat/completions" || path == "/chat/completions") {
@@ -244,13 +251,119 @@ func (h *Handler) health(w http.ResponseWriter) {
 	i := tokenIdentity(h.cfg.APIKey)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "mode": "direct", "version": h.version, "upstream": h.cfg.BaseURL, "sessions": h.sessions.size(), "auth": map[string]any{"kind": i.Kind, "userId": i.UserID, "domain": i.Domain, "expired": expired(h.cfg.APIKey)}})
 }
-func (h *Handler) models(w http.ResponseWriter) {
-	out := make([]map[string]any, 0, len(knownModels))
+func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	force := r.URL.Query().Get("refresh") == "1"
+	models, dynamic, err := h.catalog.list(r.Context(), force, h.fetchModels)
+	if err != nil {
+		h.logger.warn("model catalog refresh failed; using cached models", "error", err)
+	}
+	out := make([]map[string]any, 0, len(models))
 	now := time.Now().Unix()
-	for _, m := range knownModels {
+	for _, m := range models {
 		out = append(out, map[string]any{"id": m, "object": "model", "created": now, "owned_by": "codebuddy"})
 	}
+	if dynamic {
+		w.Header().Set("X-CodeBuddy-Models-Source", "remote")
+	} else {
+		w.Header().Set("X-CodeBuddy-Models-Source", "fallback")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
+}
+
+type modelCatalog struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	models  []string
+	checked time.Time
+	dynamic bool
+}
+
+func newModelCatalog(ttl time.Duration) *modelCatalog {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	return &modelCatalog{ttl: ttl, models: append([]string(nil), knownModels...)}
+}
+func (c *modelCatalog) list(ctx context.Context, force bool, fetch func(context.Context) ([]string, error)) ([]string, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !force && !c.checked.IsZero() && time.Since(c.checked) < c.ttl {
+		return append([]string(nil), c.models...), c.dynamic, nil
+	}
+	models, err := fetch(ctx)
+	c.checked = time.Now()
+	if err != nil {
+		return append([]string(nil), c.models...), c.dynamic, err
+	}
+	c.models, c.dynamic = models, true
+	return append([]string(nil), c.models...), c.dynamic, nil
+}
+
+func (h *Handler) fetchModels(ctx context.Context) ([]string, error) {
+	endpoint, err := modelConfigURL(h.cfg.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range h.headers(newSession()) {
+		req.Header.Set(k, v)
+	}
+	// The configuration service validates this official CLI user-agent format.
+	req.Header.Set("User-Agent", "CodeBuddy/"+cliVersion)
+	req.Header.Set("X-Product-Version", cliVersion)
+	req.Header.Set("Connection", "close")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("model configuration returned HTTP %d", resp.StatusCode)
+	}
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Models []struct {
+				ID       string `json:"id"`
+				Disabled bool   `json:"disabled"`
+			} `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&result); err != nil {
+		return nil, err
+	}
+	if result.Code != 0 {
+		return nil, fmt.Errorf("model configuration failed: %s", result.Msg)
+	}
+	ids := make([]string, 0, len(result.Data.Models))
+	seen := make(map[string]struct{}, len(result.Data.Models))
+	for _, model := range result.Data.Models {
+		id := strings.TrimSpace(model.ID)
+		if id == "" || model.Disabled {
+			continue
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, errors.New("model configuration returned no enabled models")
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+func modelConfigURL(baseURL string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid CodeBuddy base URL")
+	}
+	u.Path, u.RawQuery, u.Fragment = "/v3/config", "", ""
+	return u.String(), nil
 }
 
 func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
@@ -270,9 +383,10 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wantStream, _ := payload["stream"].(bool)
+	hasImage := hasImageInput(sliceValue(payload["messages"]))
 	model := h.cfg.DefaultModel
-	if v, ok := payload["model"].(string); ok && modelKnown(v) {
-		model = v
+	if v, ok := payload["model"].(string); ok && strings.TrimSpace(v) != "" {
+		model = strings.TrimSpace(v)
 	}
 	payload["model"] = model
 	payload["stream"] = true
@@ -306,7 +420,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if wantStream {
-		stats, err := h.relaySSE(w, resp.Body, model)
+		stats, err := h.relaySSE(w, resp.Body, model, hasImage && h.cfg.ShowReasoning)
 		attrs := []any{"model", model, "stream", true, "chunk_count", stats.chunks, "upstream_ms", upstreamMS, "duration_ms", time.Since(started).Milliseconds()}
 		if !stats.firstToken.IsZero() {
 			attrs = append(attrs, "ttft_ms", stats.firstToken.Sub(started).Milliseconds())
@@ -326,8 +440,24 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", nil)
 		return
 	}
+	if !h.cfg.ShowReasoning {
+		removeReasoning(chunks)
+	}
 	writeJSON(w, http.StatusOK, aggregate(chunks, model))
 	h.logger.info("chat request completed", append([]any{"model", model, "stream", false, "chunk_count", len(chunks), "upstream_ms", upstreamMS, "duration_ms", time.Since(started).Milliseconds()}, usageForChunks(chunks).logFields()...)...)
+}
+
+func hasImageInput(messages []any) bool {
+	for _, rawMessage := range messages {
+		message, _ := rawMessage.(map[string]any)
+		for _, rawPart := range sliceValue(message["content"]) {
+			part, _ := rawPart.(map[string]any)
+			if part["type"] == "image_url" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h *Handler) headers(s *session) map[string]string {
@@ -360,14 +490,6 @@ func runtimeOS() string {
 	default:
 		return "Unknown"
 	}
-}
-func modelKnown(v string) bool {
-	for _, m := range knownModels {
-		if v == m {
-			return true
-		}
-	}
-	return false
 }
 func stringValue(v any) string { s, _ := v.(string); return s }
 func firstNonEmpty(v ...string) string {
@@ -484,7 +606,7 @@ type streamStats struct {
 	usage      usageMetrics
 }
 
-func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) (streamStats, error) {
+func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, aggregateReasoning bool) (streamStats, error) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -493,29 +615,72 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
 	var stats streamStats
+	bufferedReasoning := make(map[int]*boundedText)
+	emit := func(chunk map[string]any) {
+		if stats.firstToken.IsZero() {
+			stats.firstToken = time.Now()
+		}
+		stats.chunks++
+		if rawUsage, ok := chunk["usage"].(map[string]any); ok {
+			stats.usage = usageFromMap(rawUsage)
+		}
+		normalized, _ := json.Marshal(normalize(chunk, model))
+		fmt.Fprintf(w, "data: %s\n\n", normalized)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	flushReasoning := func() {
+		if len(bufferedReasoning) == 0 {
+			return
+		}
+		indexes := make([]int, 0, len(bufferedReasoning))
+		for index := range bufferedReasoning {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		choices := make([]any, 0, len(indexes))
+		for _, index := range indexes {
+			if text := bufferedReasoning[index].String(); text != "" {
+				choices = append(choices, map[string]any{"index": index, "delta": map[string]any{"reasoning_content": text}, "finish_reason": nil})
+			}
+		}
+		bufferedReasoning = make(map[int]*boundedText)
+		if len(choices) > 0 {
+			emit(map[string]any{"choices": choices})
+		}
+	}
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data:") {
 			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data == "[DONE]" {
+				flushReasoning()
 				fmt.Fprint(w, "data: [DONE]\n\n")
 				if flusher != nil {
 					flusher.Flush()
 				}
 				return stats, nil
 			}
-			if stats.firstToken.IsZero() {
-				stats.firstToken = time.Now()
-			}
-			stats.chunks++
 			var chunk map[string]any
 			if json.Unmarshal([]byte(data), &chunk) == nil {
-				if rawUsage, ok := chunk["usage"].(map[string]any); ok {
-					stats.usage = usageFromMap(rawUsage)
+				if !h.cfg.ShowReasoning {
+					removeReasoning([]map[string]any{chunk})
+					if !hasVisibleSSEData(chunk) {
+						continue
+					}
+				} else if aggregateReasoning {
+					bufferReasoning(chunk, bufferedReasoning)
+					if requiresReasoningFlush(chunk) {
+						flushReasoning()
+					}
+					if !hasVisibleSSEData(chunk) {
+						continue
+					}
 				}
-				normalized, _ := json.Marshal(normalize(chunk, model))
-				fmt.Fprintf(w, "data: %s\n\n", normalized)
+				emit(chunk)
 			} else {
+				flushReasoning()
 				fmt.Fprintf(w, "data: %s\n\n", data)
 			}
 			if flusher != nil {
@@ -523,11 +688,71 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 			}
 		}
 	}
+	flushReasoning()
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()
 	}
 	return stats, scanner.Err()
+}
+
+type boundedText struct {
+	text      strings.Builder
+	truncated bool
+}
+
+func (b *boundedText) Add(value string) {
+	if value == "" || b.truncated {
+		return
+	}
+	remaining := maxBufferedReasoningBytes - b.text.Len()
+	if remaining <= 0 {
+		b.truncated = true
+		return
+	}
+	if len(value) > remaining {
+		b.text.WriteString(value[:remaining])
+		b.truncated = true
+		return
+	}
+	b.text.WriteString(value)
+}
+func (b *boundedText) String() string {
+	if b.truncated {
+		return b.text.String() + "\n\n[思考内容过长，已截断]"
+	}
+	return b.text.String()
+}
+
+func bufferReasoning(chunk map[string]any, buffered map[int]*boundedText) {
+	for _, raw := range sliceValue(chunk["choices"]) {
+		choice, _ := raw.(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		text := stringValue(delta["reasoning_content"])
+		delete(delta, "reasoning_content")
+		if text == "" {
+			continue
+		}
+		index := int(numberValue(choice["index"]))
+		if buffered[index] == nil {
+			buffered[index] = &boundedText{}
+		}
+		buffered[index].Add(text)
+	}
+}
+
+func requiresReasoningFlush(chunk map[string]any) bool {
+	for _, raw := range sliceValue(chunk["choices"]) {
+		choice, _ := raw.(map[string]any)
+		if finish := choice["finish_reason"]; finish != nil && finish != "" {
+			return true
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if stringValue(delta["content"]) != "" || delta["tool_calls"] != nil {
+			return true
+		}
+	}
+	return false
 }
 func readSSE(body io.Reader, model string) ([]map[string]any, error) {
 	var out []map[string]any
@@ -548,6 +773,30 @@ func readSSE(body io.Reader, model string) ([]map[string]any, error) {
 		}
 	}
 	return out, scanner.Err()
+}
+func removeReasoning(chunks []map[string]any) {
+	for _, chunk := range chunks {
+		for _, raw := range sliceValue(chunk["choices"]) {
+			choice, _ := raw.(map[string]any)
+			delta, _ := choice["delta"].(map[string]any)
+			delete(delta, "reasoning_content")
+		}
+	}
+}
+func hasVisibleSSEData(chunk map[string]any) bool {
+	if _, ok := chunk["usage"]; ok {
+		return true
+	}
+	for _, raw := range sliceValue(chunk["choices"]) {
+		choice, _ := raw.(map[string]any)
+		if finish := choice["finish_reason"]; finish != nil && finish != "" {
+			return true
+		}
+		if delta, _ := choice["delta"].(map[string]any); len(delta) > 0 {
+			return true
+		}
+	}
+	return false
 }
 func normalize(c map[string]any, model string) map[string]any {
 	if _, ok := c["model"]; !ok {
