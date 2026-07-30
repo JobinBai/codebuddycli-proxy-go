@@ -1,7 +1,6 @@
 services:
   codebuddycli-proxy:
-    build: .
-    image: codebuddycli-proxy:local
+    image: jobinbai/codebuddycli-proxy-go:latest
     environment:
       CODEBUDDY_API_KEY: "${CODEBUDDY_API_KEY:?Set CODEBUDDY_API_KEY in .env}"
       CODEBUDDY_INTERNET_ENVIRONMENT: "${CODEBUDDY_INTERNET_ENVIRONMENT:-internal}"
