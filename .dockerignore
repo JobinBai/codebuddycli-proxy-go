@@ -1,0 +1,8 @@
+.git
+.github
+dist
+bin
+docs
+*.md
+docker-compose.yml
+Makefile
