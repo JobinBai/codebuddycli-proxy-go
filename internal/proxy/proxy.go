@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -163,30 +163,57 @@ type Handler struct {
 	version  string
 	client   *http.Client
 	sessions *sessionStore
-	logger   *slog.Logger
+	logger   *textLogger
 }
 
 func New(cfg Config, version string) *Handler {
-	return NewWithLogger(cfg, version, nil)
+	return NewWithLogWriter(cfg, version, os.Stdout)
 }
 
-// NewWithLogger creates a handler using logger. A nil logger emits JSON logs to stdout.
-// It is primarily useful for embedding the proxy or directing logs in tests.
-func NewWithLogger(cfg Config, version string, logger *slog.Logger) *Handler {
-	if logger == nil {
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+// NewWithLogWriter creates a handler that writes Logback-style text logs to output.
+func NewWithLogWriter(cfg Config, version string, output io.Writer) *Handler {
+	if output == nil {
+		output = os.Stdout
 	}
-	return &Handler{cfg: cfg, version: version, client: &http.Client{Timeout: cfg.RequestTimeout}, sessions: newSessionStore(cfg.SessionTTL), logger: logger}
+	return &Handler{cfg: cfg, version: version, client: &http.Client{Timeout: cfg.RequestTimeout}, sessions: newSessionStore(cfg.SessionTTL), logger: newTextLogger(output)}
 }
 
 // LogStartup records the safe, operational details needed to identify a running instance.
 func (h *Handler) LogStartup(address string) {
-	h.logger.Info("server_started", "version", h.version, "address", address, "upstream", h.cfg.BaseURL)
+	h.logger.info("server started", "version", h.version, "address", address, "upstream", h.cfg.BaseURL)
 }
 
 // LogServerError records a server-level error without including request data.
 func (h *Handler) LogServerError(err error) {
-	h.logger.Error("server_stopped", "error", err)
+	h.logger.error("server stopped", "error", err)
+}
+
+type textLogger struct{ output *log.Logger }
+
+func newTextLogger(output io.Writer) *textLogger          { return &textLogger{output: log.New(output, "", 0)} }
+func (l *textLogger) info(message string, fields ...any)  { l.write("INFO", message, fields...) }
+func (l *textLogger) warn(message string, fields ...any)  { l.write("WARN", message, fields...) }
+func (l *textLogger) error(message string, fields ...any) { l.write("ERROR", message, fields...) }
+func (l *textLogger) write(level, message string, fields ...any) {
+	var line strings.Builder
+	fmt.Fprintf(&line, "%s %-5s [codebuddy-proxy] %s", time.Now().Format("2006-01-02 15:04:05.000"), level, message)
+	for i := 0; i+1 < len(fields); i += 2 {
+		fmt.Fprintf(&line, " %s=%s", fields[i], logField(fields[i+1]))
+	}
+	l.output.Print(line.String())
+}
+func logField(value any) string {
+	switch v := value.(type) {
+	case string:
+		if strings.ContainsAny(v, " \t\r\n=\"") {
+			return strconv.Quote(v)
+		}
+		return v
+	case error:
+		return strconv.Quote(v.Error())
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -253,11 +280,12 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	s := h.sessions.acquire(key)
 	s.beginTurn()
 	started := time.Now()
-	h.logger.Info("chat_request_started", "model", model, "stream", wantStream, "message_count", len(msgs), "session_reused", key != "")
+	prompt := formatPrompts(msgs)
+	h.logger.info("chat request started", "model", model, "stream", wantStream, "message_count", len(msgs), "session_reused", key != "", "prompt", prompt)
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, strings.TrimRight(h.cfg.BaseURL, "/")+"/chat/completions", strings.NewReader(string(body)))
 	if err != nil {
-		h.logger.Error("chat_request_failed", "model", model, "stream", wantStream, "stage", "create_upstream_request", "duration_ms", time.Since(started).Milliseconds())
+		h.logger.error("chat request failed", "model", model, "stream", wantStream, "stage", "create_upstream_request", "duration_ms", time.Since(started).Milliseconds())
 		writeError(w, http.StatusInternalServerError, err.Error(), "internal_error", nil)
 		return
 	}
@@ -266,38 +294,40 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.logger.Error("chat_request_failed", "model", model, "stream", wantStream, "stage", "connect_upstream", "duration_ms", time.Since(started).Milliseconds())
+		h.logger.error("chat request failed", "model", model, "stream", wantStream, "stage", "connect_upstream", "duration_ms", time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", nil)
 		return
 	}
 	defer resp.Body.Close()
+	upstreamMS := time.Since(started).Milliseconds()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.logger.Warn("upstream_response_failed", "model", model, "stream", wantStream, "upstream_status", resp.StatusCode, "duration_ms", time.Since(started).Milliseconds())
+		h.logger.warn("upstream response failed", "model", model, "stream", wantStream, "upstream_status", resp.StatusCode, "upstream_ms", upstreamMS, "duration_ms", time.Since(started).Milliseconds())
 		h.upstreamFailure(w, resp)
 		return
 	}
 	if wantStream {
-		chunks, firstToken, err := h.relaySSE(w, resp.Body, model)
-		attrs := []any{"model", model, "stream", true, "chunk_count", chunks, "duration_ms", time.Since(started).Milliseconds()}
-		if !firstToken.IsZero() {
-			attrs = append(attrs, "ttft_ms", firstToken.Sub(started).Milliseconds())
+		stats, err := h.relaySSE(w, resp.Body, model)
+		attrs := []any{"model", model, "stream", true, "chunk_count", stats.chunks, "upstream_ms", upstreamMS, "duration_ms", time.Since(started).Milliseconds()}
+		if !stats.firstToken.IsZero() {
+			attrs = append(attrs, "ttft_ms", stats.firstToken.Sub(started).Milliseconds())
 		}
+		attrs = append(attrs, stats.usage.logFields()...)
 		if err != nil {
 			attrs = append(attrs, "stage", "read_upstream_stream")
-			h.logger.Error("chat_request_failed", attrs...)
+			h.logger.error("chat request failed", attrs...)
 			return
 		}
-		h.logger.Info("chat_request_completed", attrs...)
+		h.logger.info("chat request completed", attrs...)
 		return
 	}
 	chunks, err := readSSE(resp.Body, model)
 	if err != nil {
-		h.logger.Error("chat_request_failed", "model", model, "stream", false, "stage", "read_upstream_stream", "duration_ms", time.Since(started).Milliseconds())
+		h.logger.error("chat request failed", "model", model, "stream", false, "stage", "read_upstream_stream", "upstream_ms", upstreamMS, "duration_ms", time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", nil)
 		return
 	}
 	writeJSON(w, http.StatusOK, aggregate(chunks, model))
-	h.logger.Info("chat_request_completed", "model", model, "stream", false, "chunk_count", len(chunks), "duration_ms", time.Since(started).Milliseconds())
+	h.logger.info("chat request completed", append([]any{"model", model, "stream", false, "chunk_count", len(chunks), "upstream_ms", upstreamMS, "duration_ms", time.Since(started).Milliseconds()}, usageForChunks(chunks).logFields()...)...)
 }
 
 func (h *Handler) headers(s *session) map[string]string {
@@ -349,6 +379,85 @@ func firstNonEmpty(v ...string) string {
 	return ""
 }
 
+func formatPrompts(messages []any) string {
+	parts := make([]string, 0, len(messages))
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role := valueOr(stringValue(message["role"]), "unknown")
+		content := promptContent(message["content"])
+		parts = append(parts, "["+role+"] "+content)
+	}
+	return strings.Join(parts, "\n")
+}
+func promptContent(value any) string {
+	if text := stringValue(value); text != "" {
+		return text
+	}
+	parts, ok := value.([]any)
+	if !ok {
+		return fmt.Sprint(value)
+	}
+	text := make([]string, 0, len(parts))
+	for _, raw := range parts {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if v := firstNonEmpty(stringValue(item["text"]), stringValue(item["content"])); v != "" {
+			text = append(text, v)
+		}
+	}
+	return strings.Join(text, "\n")
+}
+
+type usageMetrics struct {
+	prompt, completion, total, cached int64
+}
+
+func (u usageMetrics) logFields() []any {
+	return []any{"prompt_tokens", u.prompt, "completion_tokens", u.completion, "total_tokens", u.total, "cached_tokens", u.cached}
+}
+func usageForChunks(chunks []map[string]any) usageMetrics {
+	var usage usageMetrics
+	for _, chunk := range chunks {
+		if raw, ok := chunk["usage"].(map[string]any); ok {
+			usage = usageFromMap(raw)
+		}
+	}
+	return usage
+}
+func usageFromMap(raw map[string]any) usageMetrics {
+	u := usageMetrics{
+		prompt: tokenCount(raw, "prompt_tokens", "input_tokens"), completion: tokenCount(raw, "completion_tokens", "output_tokens"), total: tokenCount(raw, "total_tokens"),
+		cached: tokenCount(raw, "cached_tokens", "cache_read_input_tokens"),
+	}
+	if details, ok := raw["prompt_tokens_details"].(map[string]any); ok {
+		if cached := tokenCount(details, "cached_tokens", "cache_read_input_tokens"); cached > 0 {
+			u.cached = cached
+		}
+	}
+	return u
+}
+func tokenCount(raw map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		switch v := raw[key].(type) {
+		case float64:
+			return int64(v)
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		case json.Number:
+			n, _ := v.Int64()
+			return n
+		}
+	}
+	return 0
+}
+
 func (h *Handler) upstreamFailure(w http.ResponseWriter, resp *http.Response) {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var data map[string]any
@@ -368,7 +477,14 @@ func (h *Handler) upstreamFailure(w http.ResponseWriter, resp *http.Response) {
 	}
 	writeError(w, status, msg, "upstream_error", data["code"])
 }
-func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) (int, time.Time, error) {
+
+type streamStats struct {
+	chunks     int
+	firstToken time.Time
+	usage      usageMetrics
+}
+
+func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) (streamStats, error) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -376,8 +492,7 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 	flusher, _ := w.(http.Flusher)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
-	var chunks int
-	var firstToken time.Time
+	var stats streamStats
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data:") {
@@ -387,14 +502,17 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 				if flusher != nil {
 					flusher.Flush()
 				}
-				return chunks, firstToken, nil
+				return stats, nil
 			}
-			if firstToken.IsZero() {
-				firstToken = time.Now()
+			if stats.firstToken.IsZero() {
+				stats.firstToken = time.Now()
 			}
-			chunks++
+			stats.chunks++
 			var chunk map[string]any
 			if json.Unmarshal([]byte(data), &chunk) == nil {
+				if rawUsage, ok := chunk["usage"].(map[string]any); ok {
+					stats.usage = usageFromMap(rawUsage)
+				}
 				normalized, _ := json.Marshal(normalize(chunk, model))
 				fmt.Fprintf(w, "data: %s\n\n", normalized)
 			} else {
@@ -409,7 +527,7 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string) 
 	if flusher != nil {
 		flusher.Flush()
 	}
-	return chunks, firstToken, scanner.Err()
+	return stats, scanner.Err()
 }
 func readSSE(body io.Reader, model string) ([]map[string]any, error) {
 	var out []map[string]any

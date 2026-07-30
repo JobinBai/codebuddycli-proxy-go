@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log/slog"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -14,7 +14,7 @@ var version = "dev"
 func main() {
 	cfg, err := proxy.LoadConfigFromEnv()
 	if err != nil {
-		slog.New(slog.NewJSONHandler(os.Stdout, nil)).Error("configuration_error", "error", err)
+		fmt.Fprintf(os.Stderr, "%s ERROR [codebuddy-proxy] configuration error=%q\n", time.Now().Format("2006-01-02 15:04:05.000"), err)
 		os.Exit(1)
 	}
 	h := proxy.New(cfg, version)
