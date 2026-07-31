@@ -362,3 +362,113 @@ func TestReasoningParamsNotInjectedWhenHidden(t *testing.T) {
 		t.Fatalf("reasoning params must not be injected when hidden: %v", gotBody)
 	}
 }
+
+// TestReasoningParamsNestedReasoningGetsTopLevelEffort verifies Codex's fix #5:
+// when the client supplies only the nested reasoning object, the proxy backfills
+// the top-level reasoning_effort field that CodeBuddy needs to enable thinking,
+// instead of returning early and leaving reasoning off.
+func TestReasoningParamsNestedReasoningGetsTopLevelEffort(t *testing.T) {
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: true}, "test", io.Discard)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"role":"user","content":"hi"}],"stream":false,"reasoning":{"effort":"medium"}}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if gotBody["reasoning_effort"] != "medium" {
+		t.Fatalf("expected top-level reasoning_effort=medium derived from nested reasoning, got %v", gotBody["reasoning_effort"])
+	}
+	reasoning, ok := gotBody["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "medium" {
+		t.Fatalf("nested reasoning must be preserved: %v", gotBody["reasoning"])
+	}
+}
+
+// timedResponseWriter records each Write together with the time it happened, so
+// timing-sensitive behavior (e.g. the coalesce timer firing during an upstream
+// pause) can be asserted. The proxy is the sole writer, so no locking is needed.
+type timedResponseWriter struct {
+	code   int
+	header http.Header
+	chunks []string
+	times  []time.Time
+}
+
+func (t *timedResponseWriter) Header() http.Header {
+	if t.header == nil {
+		t.header = http.Header{}
+	}
+	return t.header
+}
+func (t *timedResponseWriter) Write(b []byte) (int, error) {
+	t.chunks = append(t.chunks, string(b))
+	t.times = append(t.times, time.Now())
+	return len(b), nil
+}
+func (t *timedResponseWriter) WriteHeader(c int) { t.code = c }
+func (t *timedResponseWriter) Flush()            {}
+
+func writeReasoningChunk(w io.Writer, index int, text string) {
+	fmt.Fprintf(w, "data: {\"choices\":[{\"index\":%d,\"delta\":{\"reasoning_content\":%s}}]}\n\n", index, jsonString(text))
+}
+func writeContentChunk(w io.Writer, index int, text, finish string) {
+	fmt.Fprintf(w, "data: {\"choices\":[{\"index\":%d,\"delta\":{\"content\":%s},\"finish_reason\":%s}]}\n\n", index, jsonString(text), jsonString(finish))
+}
+func indexOfChunkWith(w *timedResponseWriter, substr string) int {
+	for i, c := range w.chunks {
+		if strings.Contains(c, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestTextStreamingReasoningCoalesceTimerFiresDuringPause proves Codex's P1:
+// the coalescing window is driven by an active timer, not merely by the arrival
+// of the next upstream chunk. After buffering reasoning, if the upstream goes
+// silent for longer than REASONING_COALESCE_MS, the proxy must emit the buffered
+// reasoning on its own — before the stream ends and before any later chunk.
+func TestTextStreamingReasoningCoalesceTimerFiresDuringPause(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing-sensitive test")
+	}
+	const interval = 150 * time.Millisecond
+	pr, pw := io.Pipe()
+	started := make(chan struct{})
+	t0 := time.Now()
+	go func() {
+		defer pw.Close()
+		<-started
+		writeReasoningChunk(pw, 0, "first")  // emitted immediately (firstReasoningSent)
+		writeReasoningChunk(pw, 0, "second") // buffered; window armed
+		// Upstream falls silent. Without an active timer the proxy would hold
+		// "second" until the next chunk / stream end.
+		time.Sleep(400 * time.Millisecond)
+		writeContentChunk(pw, 0, "answer", "stop")
+	}()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: "http://example.invalid", DefaultModel: "hy3", RequestTimeout: 5 * time.Second, SessionTTL: time.Minute, ShowReasoning: true, ReasoningCoalesce: true, ReasoningCoalesceInterval: interval}, "test", io.Discard)
+	w := &timedResponseWriter{}
+	close(started)
+	if _, err := h.relaySSE(w, pr, "hy3", reasoningCoalesce); err != nil {
+		t.Fatalf("relaySSE err: %v", err)
+	}
+	firstIdx := indexOfChunkWith(w, `"first"`)
+	secondIdx := indexOfChunkWith(w, `"second"`)
+	answerIdx := indexOfChunkWith(w, "answer")
+	if firstIdx < 0 || secondIdx < 0 || answerIdx < 0 {
+		t.Fatalf("missing events: %v", w.chunks)
+	}
+	if secondIdx >= answerIdx {
+		t.Fatalf("timer-flushed reasoning (second) must precede final content: %v", w.chunks)
+	}
+	// The "second" reasoning event must have been emitted during the upstream
+	// pause (well before the content chunk written at ~t0+400ms), proving the
+	// timer fired on its own rather than on the next chunk's arrival.
+	if w.times[secondIdx].Sub(t0) >= 350*time.Millisecond {
+		t.Fatalf("coalesce timer did not fire during pause; second event at %v (t0=%v): %v", w.times[secondIdx], t0, w.chunks)
+	}
+}

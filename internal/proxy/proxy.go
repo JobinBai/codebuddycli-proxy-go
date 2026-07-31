@@ -657,14 +657,11 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, 
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64<<10), 8<<20)
+
 	var stats streamStats
 	bufferedReasoning := make(map[int]*boundedText)
-	// coalesceStart marks when the current reasoning window began. It is set the
-	// first time a reasoning delta is buffered and reset after every flush, so the
-	// time window keeps advancing even when no flush has happened yet.
-	coalesceStart := time.Time{}
+	firstReasoningSent := false
+
 	emit := func(chunk map[string]any) {
 		if stats.firstToken.IsZero() {
 			stats.firstToken = time.Now()
@@ -679,7 +676,34 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, 
 			flusher.Flush()
 		}
 	}
+	flushRaw := func(format string, args ...any) {
+		fmt.Fprintf(w, format, args...)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	done := func() { flushRaw("data: [DONE]\n\n") }
+
+	// Flush timer drives the coalescing window so buffered reasoning is emitted on
+	// its own cadence, instead of only when the next upstream chunk happens to
+	// arrive. It stays stopped unless a reasoning window is open, and the main
+	// loop is the only writer of w, so the timer never races with emit.
+	flushTimer := time.NewTimer(time.Hour)
+	flushTimer.Stop()
+	stopFlushTimer := func() {
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+	}
+	armFlushTimer := func() {
+		stopFlushTimer()
+		flushTimer.Reset(h.cfg.ReasoningCoalesceInterval)
+	}
 	flushReasoning := func() {
+		stopFlushTimer()
 		if len(bufferedReasoning) == 0 {
 			return
 		}
@@ -691,95 +715,96 @@ func (h *Handler) relaySSE(w http.ResponseWriter, body io.Reader, model string, 
 		choices := make([]any, 0, len(indexes))
 		for _, index := range indexes {
 			if text := bufferedReasoning[index].String(); text != "" {
-				choices = append(choices, map[string]any{"index": index, "delta": map[string]any{"reasoning_content": text}, "finish_reason": nil})
+				// Include role:"assistant" so strict clients see a well-formed
+				// delta, matching the initial role event from the upstream.
+				choices = append(choices, map[string]any{"index": index, "delta": map[string]any{"role": "assistant", "reasoning_content": text}, "finish_reason": nil})
 			}
 		}
 		bufferedReasoning = make(map[int]*boundedText)
-		coalesceStart = time.Now()
 		if len(choices) > 0 {
 			emit(map[string]any{"choices": choices})
 		}
 	}
-	// coalesceShouldFlush decides whether the buffered reasoning should be emitted
-	// now: either enough wall-clock time passed (keeps the stream feeling live) or
-	// enough text accumulated (bounds event count and memory). An unset lastFlush
-	// (zero value) always flushes, so the first reasoning characters appear at once.
-	coalesceShouldFlush := func() bool {
-		if mode != reasoningCoalesce {
-			return false
+
+	// Read upstream SSE lines in a dedicated goroutine and feed them through a
+	// channel, so the main loop can also react to the flush timer without
+	// depending on the next upstream chunk. The reader only writes to the channel,
+	// keeping the ResponseWriter single-writer.
+	lines := make(chan string, 64)
+	var scanErr error
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(make([]byte, 64<<10), 8<<20)
+		for scanner.Scan() {
+			lines <- scanner.Text()
 		}
-		if !coalesceStart.IsZero() && h.cfg.ReasoningCoalesceInterval > 0 && time.Since(coalesceStart) >= h.cfg.ReasoningCoalesceInterval {
-			return true
-		}
-		if h.cfg.ReasoningCoalesceChars > 0 {
-			total := 0
-			for _, b := range bufferedReasoning {
-				total += b.Len()
-				if total >= h.cfg.ReasoningCoalesceChars {
-					return true
-				}
+		scanErr = scanner.Err()
+	}()
+
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				flushReasoning()
+				done()
+				return stats, scanErr
 			}
-		}
-		return false
-	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "data:") {
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
 			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data == "[DONE]" {
 				flushReasoning()
-				fmt.Fprint(w, "data: [DONE]\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
+				done()
 				return stats, nil
 			}
 			var chunk map[string]any
-			if json.Unmarshal([]byte(data), &chunk) == nil {
-				switch mode {
-				case reasoningOff:
-					removeReasoning([]map[string]any{chunk})
-					if !hasVisibleSSEData(chunk) {
-						continue
-					}
-				case reasoningAggregate:
-					bufferReasoning(chunk, bufferedReasoning)
-					if requiresReasoningFlush(chunk) {
-						flushReasoning()
-					}
-					if !hasVisibleSSEData(chunk) {
-						continue
-					}
-				case reasoningCoalesce:
-					bufferReasoning(chunk, bufferedReasoning)
-					if coalesceStart.IsZero() {
-						coalesceStart = time.Now()
-					}
-					if requiresReasoningFlush(chunk) || coalesceShouldFlush() {
-						flushReasoning()
-					}
-					if !hasVisibleSSEData(chunk) {
-						continue
-					}
-				case reasoningPassthrough:
-					// forward reasoning deltas verbatim, do not strip
-				}
-				emit(chunk)
-			} else {
+			if json.Unmarshal([]byte(data), &chunk) != nil {
 				flushReasoning()
-				fmt.Fprintf(w, "data: %s\n\n", data)
+				flushRaw("data: %s\n\n", data)
+				continue
 			}
-			if flusher != nil {
-				flusher.Flush()
+			switch mode {
+			case reasoningOff:
+				removeReasoning([]map[string]any{chunk})
+				if !hasVisibleSSEData(chunk) {
+					continue
+				}
+			case reasoningAggregate:
+				bufferReasoning(chunk, bufferedReasoning)
+				if requiresReasoningFlush(chunk) {
+					flushReasoning()
+				}
+				if !hasVisibleSSEData(chunk) {
+					continue
+				}
+			case reasoningCoalesce:
+				bufferReasoning(chunk, bufferedReasoning)
+				if !firstReasoningSent {
+					// First reasoning characters go out immediately (zero
+					// perceived latency); later deltas are coalesced by window.
+					flushReasoning()
+					firstReasoningSent = true
+				} else if len(bufferedReasoning) > 0 {
+					armFlushTimer()
+				}
+				if requiresReasoningFlush(chunk) {
+					flushReasoning()
+				}
+				if !hasVisibleSSEData(chunk) {
+					continue
+				}
+			case reasoningPassthrough:
+				// forward reasoning deltas verbatim, do not strip
+			}
+			emit(chunk)
+		case <-flushTimer.C:
+			if mode == reasoningCoalesce && len(bufferedReasoning) > 0 {
+				flushReasoning()
 			}
 		}
 	}
-	flushReasoning()
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
-	return stats, scanner.Err()
 }
 
 type boundedText struct {
@@ -877,18 +902,32 @@ func removeReasoning(chunks []map[string]any) {
 	}
 }
 
-// ensureReasoningParams injects default reasoning parameters when the client
-// did not provide them. This makes reasoning appear by default while still
-// respecting an explicit client choice.
+// ensureReasoningParams injects the reasoning parameters CodeBuddy needs to
+// enable thinking, while respecting an explicit client choice. Default behavior
+// (neither field supplied) auto-enables reasoning at "high" effort. If the
+// client supplied only one form, the missing complementary field is derived so
+// the upstream reliably turns thinking on — CodeBuddy requires the top-level
+// reasoning_effort field, so a nested-only request gets it backfilled.
 func ensureReasoningParams(payload map[string]any) {
-	if payload["reasoning_effort"] != nil {
+	_, hasEff := payload["reasoning_effort"]
+	reasoning, hasRsn := payload["reasoning"]
+	if hasEff && hasRsn {
 		return
 	}
-	if payload["reasoning"] != nil {
+	if !hasEff && !hasRsn {
+		payload["reasoning_effort"] = "high"
+		payload["reasoning"] = map[string]any{"effort": "high", "summary": "auto"}
 		return
 	}
-	payload["reasoning_effort"] = "high"
-	payload["reasoning"] = map[string]any{"effort": "high", "summary": "auto"}
+	if hasRsn && !hasEff {
+		effort := "high"
+		if rmap, ok := reasoning.(map[string]any); ok {
+			if e, ok := rmap["effort"].(string); ok && e != "" {
+				effort = e
+			}
+		}
+		payload["reasoning_effort"] = effort
+	}
 }
 func hasVisibleSSEData(chunk map[string]any) bool {
 	if usage, ok := chunk["usage"]; ok && usage != nil {
@@ -899,25 +938,30 @@ func hasVisibleSSEData(chunk map[string]any) bool {
 		if finish := choice["finish_reason"]; finish != nil && finish != "" {
 			return true
 		}
-		if delta, _ := choice["delta"].(map[string]any); len(delta) > 0 {
-			for _, v := range delta {
-				if !isEmptyDeltaValue(v) {
-					return true
-				}
-			}
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			continue
 		}
-	}
-	return false
-}
-
-func isEmptyDeltaValue(v any) bool {
-	switch x := v.(type) {
-	case nil:
-		return true
-	case string:
-		return x == "" || x == "assistant"
-	case []any:
-		return len(x) == 0
+		// Preserve the initial role event (good client compatibility) and any
+		// meaningful content field. Pure-noise deltas from the upstream
+		// (e.g. content:"" alongside tool_calls:[]) are skipped. Judgment is
+		// field-aware: a literal string "assistant" in content is real text and
+		// must NOT be treated as empty.
+		if _, ok := delta["role"]; ok {
+			return true
+		}
+		if stringValue(delta["content"]) != "" {
+			return true
+		}
+		if stringValue(delta["reasoning_content"]) != "" {
+			return true
+		}
+		if toolCalls, ok := delta["tool_calls"].([]any); ok && len(toolCalls) > 0 {
+			return true
+		}
+		if fc, ok := delta["function_call"].(map[string]any); ok && len(fc) > 0 {
+			return true
+		}
 	}
 	return false
 }
