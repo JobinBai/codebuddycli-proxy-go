@@ -112,13 +112,16 @@ func TestStreamingReasoningCanBeEnabled(t *testing.T) {
 	}
 }
 
+// TestImageStreamingReasoningIsAggregated covers the legacy opt-in
+// (REASONING_AGGREGATE_IMAGES=1) where an image request buffers the whole
+// reasoning phase into a single event.
 func TestImageStreamingReasoningIsAggregated(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"We need \"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"analyze the image.\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"图片中是红色。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 	}))
 	defer upstream.Close()
-	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: true}, "test", io.Discard)
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: time.Second, SessionTTL: time.Minute, ShowReasoning: true, AggregateImageReasoning: true}, "test", io.Discard)
 	payload := `{"messages":[{"role":"user","content":[{"type":"text","text":"analyze image"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],"stream":true}`
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(payload)))
@@ -470,5 +473,72 @@ func TestTextStreamingReasoningCoalesceTimerFiresDuringPause(t *testing.T) {
 	// timer fired on its own rather than on the next chunk's arrival.
 	if w.times[secondIdx].Sub(t0) >= 350*time.Millisecond {
 		t.Fatalf("coalesce timer did not fire during pause; second event at %v (t0=%v): %v", w.times[secondIdx], t0, w.chunks)
+	}
+}
+
+// TestImageStreamingReasoningIsCoalescedByDefault guards the fix for image
+// requests arriving with their reasoning in one late burst. By default an image
+// request must use the same progressive coalescing as text: reasoning is
+// visible while the model is still thinking, not only once thinking completes.
+func TestImageStreamingReasoningIsCoalescedByDefault(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing-sensitive test")
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		flush := func() {
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		writeReasoningChunk(w, 0, "looking at the picture")
+		flush()
+		// Model keeps thinking for a while before producing any answer.
+		time.Sleep(400 * time.Millisecond)
+		writeReasoningChunk(w, 0, " and comparing colors")
+		writeContentChunk(w, 0, "图片中是红色。", "stop")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		flush()
+	}))
+	defer upstream.Close()
+	h := NewWithLogWriter(Config{APIKey: "ck_example_12345678", BaseURL: upstream.URL, DefaultModel: "hy3", RequestTimeout: 5 * time.Second, SessionTTL: time.Minute, ShowReasoning: true, ReasoningCoalesce: true, ReasoningCoalesceInterval: 100 * time.Millisecond}, "test", io.Discard)
+	payload := `{"messages":[{"role":"user","content":[{"type":"text","text":"analyze image"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],"stream":true}`
+	w := &timedResponseWriter{}
+	t0 := time.Now()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(payload)))
+	if w.code != http.StatusOK {
+		t.Fatalf("status %d: %v", w.code, w.chunks)
+	}
+	reasoningIdx := indexOfChunkWith(w, "looking at the picture")
+	contentIdx := indexOfChunkWith(w, "图片中是红色。")
+	if reasoningIdx < 0 || contentIdx < 0 {
+		t.Fatalf("missing events: %v", w.chunks)
+	}
+	if reasoningIdx >= contentIdx {
+		t.Fatalf("reasoning must precede content: %v", w.chunks)
+	}
+	// The first reasoning chunk must reach the client while the model is still
+	// thinking, i.e. long before the upstream resumes at ~t0+400ms. Aggregate
+	// mode would only emit it after the reasoning phase ended.
+	if elapsed := w.times[reasoningIdx].Sub(t0); elapsed >= 300*time.Millisecond {
+		t.Fatalf("image reasoning was withheld for %v; expected immediate streaming: %v", elapsed, w.chunks)
+	}
+}
+
+// TestImageReasoningModeSelection pins the routing rules so image requests do
+// not silently fall back to the late-burst aggregate mode again.
+func TestImageReasoningModeSelection(t *testing.T) {
+	coalescing := &Handler{cfg: Config{ShowReasoning: true, ReasoningCoalesce: true}}
+	if got := coalescing.reasoningModeFor(true); got != reasoningCoalesce {
+		t.Fatalf("image requests must coalesce by default, got %v", got)
+	}
+	legacy := &Handler{cfg: Config{ShowReasoning: true, ReasoningCoalesce: true, AggregateImageReasoning: true}}
+	if got := legacy.reasoningModeFor(true); got != reasoningAggregate {
+		t.Fatalf("REASONING_AGGREGATE_IMAGES=1 must restore aggregate, got %v", got)
+	}
+	hidden := &Handler{cfg: Config{ShowReasoning: false, AggregateImageReasoning: true}}
+	if got := hidden.reasoningModeFor(true); got != reasoningOff {
+		t.Fatalf("HIDE_REASONING must win over image aggregate, got %v", got)
 	}
 }

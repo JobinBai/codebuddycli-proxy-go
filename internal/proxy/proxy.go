@@ -38,6 +38,11 @@ type Config struct {
 	ReasoningCoalesce         bool
 	ReasoningCoalesceInterval time.Duration
 	ReasoningCoalesceChars    int
+	// AggregateImageReasoning restores the legacy behavior where image requests
+	// buffer the entire reasoning phase into a single event. It is off by default
+	// because it delays reasoning until thinking finishes; image requests now use
+	// the same progressive coalescing as text.
+	AggregateImageReasoning bool
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -53,6 +58,7 @@ func LoadConfigFromEnv() (Config, error) {
 		ReasoningCoalesce:         os.Getenv("REASONING_COALESCE") != "0",
 		ReasoningCoalesceInterval: durationEnv("REASONING_COALESCE_MS", 250*time.Millisecond),
 		ReasoningCoalesceChars:    intEnv("REASONING_COALESCE_CHARS", 1024),
+		AggregateImageReasoning:   os.Getenv("REASONING_AGGREGATE_IMAGES") == "1",
 	}, nil
 }
 
@@ -640,11 +646,13 @@ func (h *Handler) reasoningModeFor(hasImage bool) reasoningMode {
 	if !h.cfg.ShowReasoning {
 		return reasoningOff
 	}
-	if hasImage {
-		// Images already reason briefly; keep the single-event aggregate so the
-		// existing contract (one aggregated reasoning event) is preserved.
+	if hasImage && h.cfg.AggregateImageReasoning {
+		// Legacy opt-in: one aggregated reasoning event per image request. This
+		// necessarily withholds reasoning until the whole thinking phase ends.
 		return reasoningAggregate
 	}
+	// Images use the same progressive coalescing as text so reasoning streams as
+	// it is produced instead of arriving in one late burst.
 	if h.cfg.ReasoningCoalesce {
 		return reasoningCoalesce
 	}
